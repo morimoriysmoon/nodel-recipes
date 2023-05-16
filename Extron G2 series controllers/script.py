@@ -147,7 +147,7 @@ def bindEverything():
           console.warn('Got error; ignoring...')
           raise
 
- 	  bindPort(controlSummaryPath)
+      bindPort(controlSummaryPath)
 
     # check if any bindings completed.
     global everBound
