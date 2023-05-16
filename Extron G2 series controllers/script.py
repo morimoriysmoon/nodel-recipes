@@ -5,6 +5,7 @@
 #    http://media.extron.com/download/files/userman/68-1715-01_IPL_250_A_080509.pdf
 
 import xml.etree.ElementTree as ET
+import sys                         # for exception dump
 
 # aborts after parse failure. Used for scrict testing; should be False in production
 strictParse = True
@@ -28,6 +29,13 @@ param_reservedPorts = Parameter({'title': 'Reserved ports', 'schema': {'type': '
 param_useControlSummary = Parameter({'title': 'Use "control summary file"?', "schema": {"type": "boolean"} ,"order":"-10"})
 
 urlBase = ""
+
+# Note:
+# bindEverything function was called every time TCP reconnected.
+# bindPort function (= ExtronPort class) uses global nextSeqNum() to create unique event/action name,
+# which leads to change action/event name on tcp re-establishment. Because nextSeqNum() globally holds value.
+# So we need to make sure bindEverything is called just one time.
+everBound = False
 
 # initialised in main
 reservedNamesByPortNum = {}
@@ -133,10 +141,23 @@ def bindEverything():
       print 'Extracted device URLs:', urls
 
       for url in urls:
+        try:
           bindPort(url)
+        except:
+          console.warn('Got error; ignoring...')
+          raise
 
  	  bindPort(controlSummaryPath)
-        
+
+    # check if any bindings completed.
+    global everBound
+    for port in ports:
+      if port.subnode:
+        everBound = True
+        return
+
+    everBound = False
+
 def unbindEverything():
     for port in ports:
         if port.subnode:
@@ -163,6 +184,8 @@ def local_action_RequestFirmware(arg = None):
     tcp.request('q', lambda resp: local_event_Firmware.emit(resp))
 
 def tcp_connected():
+    console.info('tcp_connected')
+  
     local_event_TCPConnected.emit()
     ping_timer.setInterval(60)
     ping_timer.start()
@@ -174,21 +197,30 @@ def tcp_connected():
     # receive the files
     # listFiles()
     
-    bindEverything()
+    if not everBound:
+        bindEverything()
+    else:
+        console.warn('Already bound. Do not bind again.')
     
 def tcp_disconnected():
+    console.warn('tcp_disconnected')
+  
     local_event_TCPDisconnected.emit()
     ping_timer.stop()
     
     unbindEverything()
 
 def tcp_sent(data):
+    log(2, 'tcp_sent [%s]' % data)
+    
     local_event_TCPSent.emit(data)
   
 def tcp_timeout():
     local_event_TCPTimeout.emit()
   
 def tcp_received(data):
+    log(2, 'tcp_recv [%s]' % data)
+  
     local_event_TCPReceived.emit(data)
     
     lastReceive[0] = system_clock()
@@ -235,6 +267,11 @@ eventCallbacks = {}
 
 def bindPort(url):
     console.info('Binding port against URL "%s"' % url)
+    
+    if not url.startswith('http://'):
+      console.warn('invalid url; ignoring [%s]' % url)
+      return
+    
     port = ExtronPort(url)
     name = url
 
@@ -259,8 +296,10 @@ def bindPort(url):
 
               console.log(name + ': ' + info)
 
-    except Exception, e:
-        console.error('%s: ERROR - %s' % (name, e))
+    except:
+        eType, eValue, eTraceback = sys.exc_info()
+    
+        console.error('%s: Failure; exception was [%s, %s, %s]' % (name, eType, eValue, eTraceback))
         
         if strictParse:
             raise
@@ -426,10 +465,14 @@ class ExtronPort:
 
             name = commandLabel + ' ' + state
             
-            event = self.subnode.addEvent(name, { 'title': state,
-                                                  'desc': "When '%s' is in '%s' state." % (commandLabel, state),
-                                                  'group': commandLabel,
-                                                  'order': nextSeqNum() })
+            try:
+              event = self.subnode.addEvent(name, { 'title': state,
+                                                    'desc': "When '%s' is in '%s' state." % (commandLabel, state),
+                                                    'group': commandLabel,
+                                                    'order': nextSeqNum() })
+            except:
+              console.warn('   (problem with %s; duplicate? ignoring...)' % name)
+              continue
             
             code = subitem.attrib['compare']
             events[code] = (event, state)
@@ -444,10 +487,15 @@ class ExtronPort:
             tcp.request(retrieve_cmd, lambda data: handleFeedback(data, events))
 
         name = 'Refresh ' + commandLabel
-        action = self.subnode.addAction(name, actionHandler, { 'title': 'Refresh', 
-                                                               'desc': "Refreshes '%s' state." % commandLabel, 
-                                                               'group': commandLabel,
-                                                               'order': nextSeqNum() })
+        try:
+          action = self.subnode.addAction(name, actionHandler, { 'title': 'Refresh', 
+                                                                 'desc': "Refreshes '%s' state." % commandLabel, 
+                                                                 'group': commandLabel,
+                                                                 'order': nextSeqNum() })
+        except:
+          console.warn('    (problem with %s; duplicate? ignoring...)' % name)
+          
+          
 
     # <command label="Power" control-rowlimit="3" command-priority="2" id="1" show="1">
     #   <item cmddown="W1,2,76,1LE|" current="W1,2,104LE|" type="set" compare="1" item-priority="1">On</item>
@@ -456,7 +504,11 @@ class ExtronPort:
     # 'events' - events (by compare code)
     def bindSetItem(self, command, item, retrieverArg, events):
         state = item.text
-        commandLabel = command.attrib['label']
+        commandLabel = command.attrib.get('label')
+        
+        if not commandLabel:
+          console.warn("   (could not find 'label' attribute; skipping %s)" % state)
+          return
 
         retriever = retrieverArg
         
@@ -468,15 +520,23 @@ class ExtronPort:
         if code is not None:
             name = commandLabel + ' ' + state
             
-            event = self.subnode.addEvent(name, { 'title': state,
-                                                  'desc': "When '%s' is in '%s' state" % (commandLabel, state),
-                                                  'group':  commandLabel,
-                                                  'order': nextSeqNum() })
+            order = nextSeqNum()
+            # watch out for brackets
+            safeName = name.replace('(', '[').replace(')', ']') + '_' + str(order)
             
-            events[code] = (event, state)
-            eventInfo = EventInfo(code, event, state, retrieve_cmd, cmd_down)
-            self.eventLookups[code] = eventInfo
-            registerGlobalEvent(eventInfo)
+            try:
+              event = self.subnode.addEvent(safeName, { 'title': state,
+                                                    'desc': "When '%s' is in '%s' state" % (commandLabel, state),
+                                                    'group':  commandLabel,
+                                                    'order': order })
+            
+              events[code] = (event, state)
+              eventInfo = EventInfo(code, event, state, retrieve_cmd, cmd_down)
+              self.eventLookups[code] = eventInfo
+              registerGlobalEvent(eventInfo)
+              
+            except:
+              console.warn('   problem with event %s; duplicate? ignoring regardless' % safeName)
 
         # retrieve action (if provided or not already been set up)
         if retrieverArg is None and retrieve_cmd is not None:
@@ -506,11 +566,16 @@ class ExtronPort:
             tcp.send(cmd_down)
             
         name = commandLabel + ' ' + state
-        action = self.subnode.addAction(name, actionHandler, { 'title': state, 
+        order = nextSeqNum()
+        safeName = name.replace('(', '[').replace(')', ']') + '_' + str(order)
+        try:
+          action = self.subnode.addAction(safeName, actionHandler, { 'title': state, 
                                                                'desc': "Calls action '%s'." % name, 
                                                                'group': commandLabel, 
                                                                'caution': cautionNeeded(commandLabel),
-                                                               'order': nextSeqNum() })
+                                                               'order': order })
+        except:
+          console.warn('   problem with action %s; duplicate? ignoring regardless' % safeName)
 
         return retriever
 
@@ -531,11 +596,16 @@ class ExtronPort:
         events = {}
         
         # event (holds state)
-        event = self.subnode.addEvent(commandLabel, { 'title': commandLabel,
-                                                      'desc': "When '%s' changes state" % commandLabel,
-                                                      'group': commandLabel,
-                                                      'order': nextSeqNum(),
-                                                      'schema': STRING_SCHEMA })
+        try:
+          event = self.subnode.addEvent(commandLabel, { 'title': commandLabel,
+                                                        'desc': "When '%s' changes state" % commandLabel,
+                                                        'group': commandLabel,
+                                                        'order': nextSeqNum(),
+                                                        'schema': STRING_SCHEMA })
+        except:
+          console.warn('   problem with event %s; duplicate? ignoring regardless' % commandLabel)
+          # event is used below, so have to just return
+          return
         
         # retrieve action (if provided or not already been set up)
         if retrieverArg is None:
@@ -563,7 +633,12 @@ class ExtronPort:
             # register event state
             state = subitem.text
             cmd_down = subitem.attrib['cmddown']
-            retrieveCurrent = subitem.attrib['current']
+            retrieveCurrent = subitem.attrib.get('current')
+            
+            if not retrieveCurrent:
+              console.warn("  skipping %s (missing 'current' attribute)" %  state)
+              continue
+            
             code = subitem.attrib['compare']
             events[code] = (event, state)
             eventInfo = EventInfo(code, event, state, retrieveCurrent, cmd_down)
@@ -1032,6 +1107,21 @@ STRING_SCHEMA = { "name" : "A name",
                   "description": "A description", 
                   "title" : "Value", 
                   "type" : "string" }
+
+# <!-- logging
+
+local_event_LogLevel = LocalEvent({'group': 'Debug', 'order': 10000+next_seq(), 'desc': 'Use this to ramp up the logging (with indentation)',  
+                                   'schema': {'type': 'integer'}})
+
+def warn(level, msg):
+  if local_event_LogLevel.getArg() >= level:
+    console.warn(('  ' * level) + msg)
+
+def log(level, msg):
+  if local_event_LogLevel.getArg() >= level:
+    console.log(('  ' * level) + msg)
+
+# --!>
 
 # status ---
 
