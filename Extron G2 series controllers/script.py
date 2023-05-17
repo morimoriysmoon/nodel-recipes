@@ -207,8 +207,9 @@ def tcp_disconnected():
   
     local_event_TCPDisconnected.emit()
     ping_timer.stop()
-    
-    unbindEverything()
+
+    if not everBound:
+      unbindEverything()
 
 def tcp_sent(data):
     log(2, 'tcp_sent [%s]' % data)
