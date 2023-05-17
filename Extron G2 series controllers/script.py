@@ -166,7 +166,13 @@ def unbindEverything():
         
     ports.clear()
     _uniqueNames.clear()
-        
+
+@at_cleanup
+def cleanup():
+  # Note:
+  # should unbind things ONLY when the recipe restarted or deleted
+  unbindEverything()
+
 local_event_TCPConnected = LocalEvent({ 'desc': 'When a TCP connection occurs.', 'group': 'Comms' })
 local_event_TCPDisconnected = LocalEvent({ 'desc': 'When a TCP disconnection occurs.', 'group': 'Comms' })
 local_event_TCPSent = LocalEvent({ 'desc': 'When TCP data is sent.', 'group': 'Comms' })
@@ -207,9 +213,6 @@ def tcp_disconnected():
   
     local_event_TCPDisconnected.emit()
     ping_timer.stop()
-
-    if not everBound:
-      unbindEverything()
 
 def tcp_sent(data):
     log(2, 'tcp_sent [%s]' % data)
